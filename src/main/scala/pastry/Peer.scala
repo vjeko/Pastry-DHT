@@ -33,7 +33,7 @@ class Peer(myID: BigInt) extends Actor with Config {
   val ls = new LeafSet(myID)
   
   val store = new HashMap[BigInt, BigInt]
-  val joinFuture = new HashSet[BigInt]  
+  val barrier, ackBarrier, originalAckBarrier = new HashSet[BigInt]  
   
   
   def getRef(peer: BigInt) : ActorSelection = {
@@ -72,7 +72,7 @@ class Peer(myID: BigInt) extends Actor with Config {
     for(peer <- msg.visitedPeers) {
       assert(peer != myID)
       
-      joinFuture += peer
+      barrier += peer
       getRef(peer) ! StateRequest(sender = myID, receiver = peer) 
     }
     
@@ -111,10 +111,11 @@ class Peer(myID: BigInt) extends Actor with Config {
   def handleState(sender : ActorRef, msg : StateRequest) = {
     val reply = StateUpdate(myID, msg.sender, rt, ls)
     getRef(msg.sender) ! reply
+    
   }
   
   
-  def handleStateReply(sender : ActorRef, msg : StateUpdate) = {
+  def handleStateReply(senderRef : ActorRef, msg : StateUpdate) = {
     val sender = msg.sender
     
     assert(msg.sender != myID)
@@ -124,18 +125,19 @@ class Peer(myID: BigInt) extends Actor with Config {
      *  closest node. Adding any additional leaf sets does not do
      *  any harm.
      */
-    rt.insert(sender)
+    rt.insertInt(sender)
     ls.insert(sender)
     
     rt.steal(msg.rt)
     ls.steal(msg.ls)
     
+    getRef(sender) ! Ack(myID, msg)
+    
     if (state == State.Joining) {
-      assert(joinFuture contains sender) 
-      joinFuture -= sender
-      if (joinFuture.isEmpty) {
+      assert(barrier contains sender) 
+      barrier -= sender
+      if (barrier.isEmpty) {
         handleCompletion()
-        logger.trace(myIDStr + ": " + "Going online...")
       }
     }
   }
@@ -147,14 +149,24 @@ class Peer(myID: BigInt) extends Actor with Config {
    * leaf set, and routing table.
    */
   def handleCompletion(): Unit = {
-    state = State.Online
+    state = State.PreOnline
     /**
      * Do we go online before or after the nodes have update the sates?
      */
-    for(peer <- rt) 
-      getRef(peer) ! StateUpdate(myID, fromBase(peer), this.rt, this.ls)
-    for(peer <- ls) 
+    for((peerStr, peerInt) <- rt) {
+      ackBarrier += peerInt
+      originalAckBarrier += peerInt
+      logger.trace(myIDStr + ": " + "Adding " + peerStr + " " + peerInt + " to " + ackBarrier)
+      getRef(peerInt) ! StateUpdate(myID, peerInt, this.rt, this.ls)
+    }
+    
+    for(peer <- ls) {
+      ackBarrier += peer
+      originalAckBarrier += peer
+      
+      logger.trace(myIDStr + ": " + "Adding " + peer + " to " + ackBarrier)
       getRef(peer) ! StateUpdate(myID, peer, this.rt, this.ls)
+    }
   }
     
 
@@ -189,6 +201,23 @@ class Peer(myID: BigInt) extends Actor with Config {
   }
   
   
+  def handleAck(senderRef : ActorRef, msg : Ack) = {
+    if (state == State.PreOnline) {
+      val sender = msg.sender
+      
+      assert(originalAckBarrier contains sender)
+      
+      ackBarrier -= sender
+      if (ackBarrier.isEmpty) {
+        state = State.Online
+        ackBarrier.clear()
+        originalAckBarrier.clear()
+        logger.trace(myIDStr + ": " + "Going online...")
+      }
+    }
+  }
+    
+  
   def receive = {
     
     // External API:
@@ -205,6 +234,8 @@ class Peer(myID: BigInt) extends Actor with Config {
     
     case msg : StateRequest => handleState(sender, msg)
     case msg : StateUpdate => handleStateReply(sender, msg)
+    
+    case msg : Ack => handleAck(sender, msg)
     
     case other => throw new Exception("unknown message " + other)
   }
